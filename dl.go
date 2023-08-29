@@ -148,14 +148,14 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
     dlclose_addr = libc.Start + dlclose_addr
 //     fmt.Printf("[*] Found dlopen address: 0x%x\n", dlopen_addr)
 
-    // Calculate size of the data we will write to the section
+    // Calculate size of the data to write to the section
     buffer_size := len(inputSO) + 1/*nt*/ + 32/*padding*/
 
     // Find a section for reading/writing/executing code
     // (Ptrace can write to non-writable regions)
     execSec, idx := process.NextSectionWithPerms(sections, Read | Execute | Private, 0)
     for execSec.Size < uint64(buffer_size) && execSec.Pathname != "[heap]" && idx < len(*sections) {
-        execSec, idx = process.NextSectionWithPerms(sections, Read | Execute, idx)
+        execSec, idx = process.NextSectionWithPerms(sections, Read | Execute | Private, idx)
     }
     if idx == len(*sections) {
         fmt.Println("[!] Couldn't find execution space!")
@@ -163,7 +163,7 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
     }
 
     // Use end of section so we don't overwrite important code
-    exec_addr := execSec.End - uintptr(buffer_size)
+    exec_addr := execSec.End - uintptr(buffer_size) - 32
 
     fmt.Printf("[*] Found execution space: 0x%x in %q\n", exec_addr, execSec.Pathname)
 
@@ -199,9 +199,9 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
         }
         defer pt.WriteData(exec_addr, &code_backup)
 
-        shellcode := []byte{0xff, 0xd0, 0xcc, 0xc3, 0x90, 0x90, 0x90, 0x0} // call rax, int3, ret, nop, nop, 0
+        shellcode := []byte{0xff, 0xd0, 0xcc, 0xc3, 0x90, 0x90}
         if is32 {
-            shellcode = append([]byte{0x56, 0x57}, shellcode...) // push esi, push edi
+            shellcode = append([]byte{0x56, 0x57}, shellcode...) // push esi, edi before call
         }
         b := shellcode
         b = append(b, inputSO...)
@@ -219,19 +219,24 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
         regs.Rip = uint64(exec_addr)
         regs.Rax = uint64(dlopen_addr)
         regs.Rdi = uint64(exec_addr) + uint64(len(shellcode))
-        regs.Rsi = 1 /* RTLD_LAZY */
+        regs.Rsi = 2 /* RTLD_NOW */
+        if is32 {
+	    regs.Rbx = regs.Rdi
+	    regs.Rcx = regs.Rsi
+	}
 
         pt.SetRegs(&regs)
 
         pt.Continue()
         signal := pt.Wait4Trap() // wait for the interrupt
 
-        if signal == 5/*SIGTRAP*/ {
+        if signal == 5/*SIGTRAP*/
+	{
             regs = pt.GetRegs()
             if regs.Rax != 0 {
                 if unload {
                     handle := regs.Rax
-                    for i := 0; i < 2; i++ { // FIXME we are assuming there's only two handle references
+                    for i := 1; i <= 2; i++ { // FIXME we are assuming there's only two handle references
                         regs.Rip = uint64(exec_addr)
                         regs.Rax = uint64(dlclose_addr)
                         regs.Rdi = handle
@@ -239,9 +244,12 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
                         pt.Continue()
                         signal = pt.Wait4Trap()
                         if signal == 5 {
-                            fmt.Printf("[+] Iteration %d succeeded\n", i);
+                            if i == 2 {
+                                fmt.Println("[+] Library removed");
+                            }
                         } else {
                             fmt.Printf("[!] Iteration %d failed\n", i);
+                            // TODO run dlerror
                         }
                     }
                     return regs.Rax
@@ -254,6 +262,7 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
             }
         } else {
             fmt.Println("[!] Process did not stop as expected:", signal)
+            // TODO run dlerror
             return 0
         }
 
