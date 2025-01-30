@@ -169,22 +169,18 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
 
     if pt.attach() {
         defer pt.detach()
-        pt.StepOnce()
 
-        // x86_64: run our shellcode after return, x32: run after push ebp
-        // (flush out the stack)
+	// make sure it stops on syscall poll() since it seems to be the safest place to run things from
+	// GDB also has similar behavior
+	regs := pt.GetRegs()
         for {
-            instr, _ := pt.ReadData(uintptr(pt.GetRegs().Rip), 1)
-            if (is32 && instr[0] == 0x55) || (!is32 && instr[0] == 0xc3) {
-                pt.StepOnce()
-                break
-            }
-            if pt.StepOnce() == false {
-                return 0
-            }
+	    if regs.Orig_rax == 7/*SYS_POLL*/ {
+		break
+	    }
+	    pt.StepOnce()
+	    pt.Wait4Trap()
+	    regs = pt.GetRegs()
         }
-
-        regs := pt.GetRegs()
 
         if curSec := process.FindSectionByAddress(sections, uintptr(regs.Rip)); curSec != nil {
             fmt.Printf("[*] Attached in %q\n", curSec.Pathname)
@@ -230,8 +226,7 @@ func (pt PTraceTool) LoadLibrary(process *Process, sections *[]ProcMapSection, u
         pt.Continue()
         signal := pt.Wait4Trap() // wait for the interrupt
 
-        if signal == 5/*SIGTRAP*/
-	{
+        if signal == 5/*SIGTRAP*/ {
             regs = pt.GetRegs()
             if regs.Rax != 0 {
                 if unload {
